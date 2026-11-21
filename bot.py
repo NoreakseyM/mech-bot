@@ -3,6 +3,14 @@ import math
 
 import mechfight as mf
 
+WEAPON_PREFERENCE = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
+SOUND_RANGES = {"near": 25.0, "mid": 100.0, "far": 220.0}
+SOUND_WEIGHTS = {"near": 0.8, "mid": 0.4, "far": 0.12}
+THREAT_SOUNDS = {
+    "gun", "mortar", "explosion", "laser", "laser_charge", "lightning",
+    "npc_gun", "boost", "jet", "step",
+}
+
 
 def unit(x, y):
     length = math.hypot(x, y)
@@ -32,44 +40,47 @@ class Bot:
             ]
             radius += (zone["next_radius"] - radius) * f
 
-        # Drift toward the next circle early; stay well inside the live one.
         next_center = zone["next_center"]
         next_radius = zone["next_radius"]
         dx, dy = next_center[0] - x, next_center[1] - y
         distance = math.hypot(dx, dy)
+        current_distance = math.hypot(x - center[0], y - center[1])
         desired_radius = max(0.0, min(radius * 0.62, next_radius * 0.62))
+        urgent = current_distance > radius - 24
         if distance > desired_radius + 10:
-            return unit(dx, dy), center, radius, distance > radius - 12
+            return unit(dx, dy), center, radius, urgent
 
-        # Orbit at a moderate radius rather than idling in the center.
-        radial = unit(x - center[0], y - center[1])
+        radial = unit(x - next_center[0], y - next_center[1])
         if radial == (0.0, 0.0):
             radial = (1.0 if self.slot % 2 == 0 else -1.0, 0.0)
-        desired = min(radius * 0.5, next_radius * 0.5)
-        correction = max(-0.7, min(0.7, (distance - desired) / max(30.0, radius * 0.4)))
+        desired = next_radius * 0.5
+        correction = max(-0.7, min(0.7, (distance - desired) / max(30.0, next_radius * 0.4)))
         direction = (
             -radial[1] * (1.0 if self.slot % 2 == 0 else -1.0) - radial[0] * correction,
             radial[0] * (1.0 if self.slot % 2 == 0 else -1.0) - radial[1] * correction,
         )
-        return unit(*direction), center, radius, distance > radius - 12
+        return unit(*direction), center, radius, urgent
 
     def _target(self, obs, me):
-        candidates = []
         x, y = me["pos"][:2]
+        best = None
+        best_score = math.inf
         for enemy in obs["mechs"]:
             if enemy["kind"] != "mech":
                 continue
             p = enemy["pos"]
-            d = math.dist((x, y), p[:2])
+            d = math.hypot(x - p[0], y - p[1])
             hp = enemy.get("hp", 1000)
-            # Low-health targets are useful finishers; nearer enemies are the
-            # immediate threat. Weapon-bearing enemies get a small priority.
             weapon_bonus = 0.0
             if "laser" in enemy.get("weapons", []):
-                weapon_bonus = 12.0
-            score = d + min(80.0, hp * 0.035) - weapon_bonus
-            candidates.append((score, d, enemy))
-        return min(candidates, default=None, key=lambda item: item[0])
+                weapon_bonus += 12.0
+            if enemy.get("charging"):
+                weapon_bonus += 18.0
+            score = d + min(105.0, hp * 0.075) - weapon_bonus
+            if score < best_score:
+                best = (score, d, enemy)
+                best_score = score
+        return best
 
     def _upgrade(self, offer, me):
         priorities = {
@@ -115,6 +126,7 @@ class Bot:
     def act(self, obs):
         me = obs["self"]
         x, y, z = me["pos"]
+        weapons = me["weapons"]
         action = {"tick": obs["tick"]}
 
         if obs["offer"]:
@@ -126,72 +138,114 @@ class Bot:
         target_dist = target_data[1] if target_data else float("inf")
 
         threat_yaw = None
+        threat_weight = 0.0
         if target is not None:
             threat_yaw = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
+            threat_weight = 1.0
         else:
-            recent = [
-                e for e in obs["events"]
-                if e["type"] == "damaged" and e.get("bearing") is not None
-            ]
-            if recent:
-                threat_yaw = recent[-1]["bearing"]
+            for event in obs["events"]:
+                bearing = event.get("bearing")
+                if event["type"] == "damaged" and bearing is not None:
+                    threat_yaw = bearing
+            if threat_yaw is not None:
+                threat_weight = 0.75
             else:
-                sounds = [
-                    s for s in obs["sounds"]
-                    if s["kind"] in ("gun", "mortar", "explosion", "laser",
-                                     "laser_charge", "lightning", "npc_gun")
-                    and s["age"] < 1.0
-                ]
-                if sounds:
-                    ranges = {"near": 25.0, "mid": 100.0, "far": 220.0}
-                    sound = min(sounds, key=lambda s: ranges[s["dist"]] + s["age"] * 45)
-                    threat_yaw = sound["bearing"]
+                best_sound_score = math.inf
+                for sound in obs["sounds"]:
+                    if sound["kind"] not in THREAT_SOUNDS or sound["age"] >= 1.5:
+                        continue
+                    score = SOUND_RANGES[sound["dist"]] + sound["age"] * 45
+                    if score < best_sound_score:
+                        best_sound_score = score
+                        threat_yaw = sound["bearing"]
+                        threat_weight = SOUND_WEIGHTS[sound["dist"]]
 
-        # Evasive motion: hold the zone, orbit, and break a pursuer's straight
-        # lead with a sideways component that reverses periodically.
+        pickup_radius = self.config["loot"]["pickup_radius"]
+        slot0 = weapons[0] if weapons else None
+        slot1 = weapons[1] if len(weapons) > 1 else None
+        held0 = slot0["kind"] if slot0 else None
+        held1 = slot1["kind"] if slot1 else None
+        held1_preference = WEAPON_PREFERENCE[held1] if held1 else -1
+        loot_target = None
+        loot_key = None
+        pickup_choice = None
+        pickup_key = None
+        pickup_radius_sq = pickup_radius * pickup_radius
+        for pickup in obs["pickups"]:
+            kind = pickup["kind"]
+            preference = WEAPON_PREFERENCE[kind]
+            if kind == held0 or kind == held1 or preference <= held1_preference:
+                continue
+            px, py, pz = pickup["pos"]
+            dx, dy = px - x, py - y
+            distance_sq = dx * dx + dy * dy
+            if distance_sq <= 90 * 90:
+                distance = math.sqrt(distance_sq)
+                candidate_key = (distance, -preference)
+                if loot_key is None or candidate_key < loot_key:
+                    loot_target = (distance, pickup)
+                    loot_key = candidate_key
+                if distance_sq <= pickup_radius_sq and abs(pz - z) <= 4:
+                    candidate_key = (preference, -distance_sq)
+                    if pickup_key is None or candidate_key > pickup_key:
+                        pickup_choice = pickup
+                        pickup_key = candidate_key
+
         mx, my = zone_dir
-        if target is not None and target_dist < 145:
+        if target is not None and target_dist < 175:
             away = unit(x - target["pos"][0], y - target["pos"][1])
             side = 1.0 if (int(obs["t"] / 2.4) + self.slot) % 2 == 0 else -1.0
-            urgency = max(0.0, min(1.5, (145.0 - target_dist) / 75.0))
-            mx += urgency * (1.4 * away[0] - 0.65 * side * away[1])
-            my += urgency * (1.4 * away[1] + 0.65 * side * away[0])
+            urgency = max(0.15, min(1.7, (175.0 - target_dist) / 75.0))
+            mx += urgency * (1.25 * away[0] - 0.7 * side * away[1])
+            my += urgency * (1.25 * away[1] + 0.7 * side * away[0])
+        elif target is not None:
+            side = 1.0 if (int(obs["t"] / 2.4) + self.slot) % 2 == 0 else -1.0
+            away = unit(x - target["pos"][0], y - target["pos"][1])
+            mx -= 0.35 * side * away[1]
+            my += 0.35 * side * away[0]
         elif threat_yaw is not None:
-            # A bearing-only threat should not pull us out of the circle.
-            d = {"near": 0.85, "mid": 0.35, "far": 0.0}
-            weight = 0.25
-            for sound in obs["sounds"]:
-                if sound["bearing"] == threat_yaw:
-                    weight = d.get(sound["dist"], 0.0)
-                    break
-            if weight:
-                mx -= math.cos(threat_yaw) * weight
-                my -= math.sin(threat_yaw) * weight
+            mx -= math.cos(threat_yaw) * threat_weight
+            my -= math.sin(threat_yaw) * threat_weight
+
+        loot_distance = float("inf")
+        if loot_target is not None and (target is None or target_dist > 100) and not urgent_zone:
+            loot_distance, pickup = loot_target
+            toward_loot = unit(pickup["pos"][0] - x, pickup["pos"][1] - y)
+            weight = 1.1 * (1.0 - loot_distance / 90.0)
+            mx += weight * toward_loot[0]
+            my += weight * toward_loot[1]
         mx, my = unit(mx, my)
         action["move"] = [mx, my]
 
         energy = me["energy"]
         action["boost"] = bool(
-            energy > 24 and (urgent_zone or (target is not None and target_dist < 95))
+            energy > 35 and (
+                urgent_zone
+                or (target is not None and target_dist < 105)
+                or (target is None and loot_distance < 65)
+            )
         )
         action["jump"] = bool(me["grounded"] and target is not None
                               and target_dist < 35 and obs["tick"] % 20 == 0)
 
         # Face the closest attacker even when not shooting; the forward arc
         # takes less damage than exposing the rear armor.
-        aim_yaw = threat_yaw if threat_yaw is not None else math.atan2(zone_center[1] - y, zone_center[0] - x)
+        scan_yaw = (obs["t"] * 1.6 + self.slot * (2 * math.pi / 16) + math.pi) % (2 * math.pi) - math.pi
+        aim_yaw = threat_yaw if threat_yaw is not None else scan_yaw
         desired_pitch = 0.0
         if target is not None:
             tx, ty, tz = target["pos"]
             vx, vy, vz = target["vel"]
             horizontal = max(1.0, math.hypot(tx - x, ty - y))
-            weapons = me["weapons"]
             gun = weapons[0]
-            use_laser = len(weapons) > 1 and weapons[1] and weapons[1]["kind"] == "laser"
-            if gun and gun["kind"] == "gun":
-                flight = horizontal / max(1.0, gun["stats"]["speed"])
-            elif use_laser:
+            laser = next((w for w in weapons if w and w["kind"] == "laser"), None)
+            laser_ready = laser and target_dist <= laser["stats"].get("range", 280.0) and (
+                laser.get("charge", 0.0) > 0 or laser["cooldown"] <= 0
+            )
+            if laser_ready:
                 flight = 0.0
+            elif gun and gun["kind"] == "gun":
+                flight = horizontal / max(1.0, gun["stats"]["speed"])
             else:
                 flight = 0.0
             px = tx + vx * flight - x
@@ -201,12 +255,8 @@ class Bot:
             desired_pitch = math.atan2(pz, max(1.0, math.hypot(px, py)))
         action["aim"] = [aim_yaw, desired_pitch]
 
-        weapons = me["weapons"]
         fire = [False, False]
-        hp = me["hp"]
-        healthy_enough_to_fight = hp >= me["max_hp"] * 0.78
-        emergency = target is not None and target_dist < 42
-        can_attack = target is not None and (healthy_enough_to_fight or emergency)
+        can_attack = target is not None
 
         if len(weapons) > 0 and weapons[0]:
             gun = weapons[0]
@@ -218,25 +268,25 @@ class Bot:
                     fire[0] = True
             elif gun["kind"] == "laser" and can_attack:
                 charge = gun.get("charge", 0.0)
-                if charge >= gun["stats"].get("charge", 0.75) * 0.88:
+                if target_dist <= gun["stats"].get("range", 280.0) and charge >= gun["stats"].get("charge", 0.75) * 0.88:
                     fire[0] = False
-                else:
+                elif target_dist <= gun["stats"].get("range", 280.0):
                     fire[0] = True
             elif gun["kind"] == "lightning" and can_attack:
                 fire[0] = target_dist <= gun["stats"].get("range", 45.0)
             elif gun["kind"] == "mortar" and can_attack:
-                fire[0] = target_dist < 145
+                fire[0] = 20 < target_dist < 60
 
         if len(weapons) > 1 and weapons[1]:
             weapon = weapons[1]
             if weapon["kind"] == "laser":
                 charge = weapon.get("charge", 0.0)
-                if can_attack:
+                if can_attack and target_dist <= weapon["stats"].get("range", 280.0):
                     fire[1] = charge < weapon["stats"].get("charge", 0.75) * 0.88
             elif weapon["kind"] == "lightning" and can_attack:
                 fire[1] = target_dist <= weapon["stats"].get("range", 45.0)
             elif weapon["kind"] == "mortar" and can_attack:
-                fire[1] = target_dist < 145
+                fire[1] = 20 < target_dist < 60
 
         if any(fire):
             action["fire"] = fire
@@ -246,20 +296,9 @@ class Bot:
         # Slot 1 is empty at spawn. Prefer laser for ranged fights, then
         # lightning; avoid mortar because self-splash and laser cook-off are
         # especially punishing in a survival-scored match.
-        held = {w["kind"] for w in weapons if w}
-        preferences = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
-        candidates = []
-        for pickup in obs["pickups"]:
-            d = math.dist((x, y), pickup["pos"][:2])
-            if d <= self.config["loot"]["pickup_radius"] and abs(pickup["pos"][2] - z) <= 4:
-                if pickup["kind"] not in held:
-                    candidates.append((preferences[pickup["kind"]], d, pickup))
-        if candidates:
-            _, _, pickup = max(candidates, key=lambda item: (item[0], -item[1]))
-            if not weapons[1]:
-                action["take"] = pickup["id"]
-            elif preferences[pickup["kind"]] > preferences[weapons[1]["kind"]]:
-                action["take"] = pickup["id"]
+        if pickup_choice is not None:
+            action["take"] = pickup_choice["id"]
+            if slot1:
                 action["drop"] = 1
 
         return action
