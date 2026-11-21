@@ -27,6 +27,7 @@ tar -xzf mechfight-kit.tar.gz
 Run the protocol check directly:
 
 ```sh
+python3 -m unittest discover -s tests -v
 python3 mechfight-kit/check/check.py -- python3 -B -u bot.py
 ```
 
