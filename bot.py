@@ -227,7 +227,7 @@ class Bot:
         )
         if calm:
             nc = obs["zone"]["next_center"]
-            if math.hypot(x - nc[0], y - nc[1]) < obs["zone"]["next_radius"] * 0.7:
+            if math.hypot(x - nc[0], y - nc[1]) < obs["zone"]["next_radius"] * 0.95:
                 mx *= 0.4
                 my *= 0.4
         action["move"] = [mx, my]
