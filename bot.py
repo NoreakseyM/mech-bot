@@ -271,7 +271,7 @@ class Bot:
         action["aim"] = [aim_yaw, desired_pitch]
 
         fire = [False, False]
-        can_attack = target is not None and (target_dist < 80 or under_fire)
+        can_attack = target is not None
 
         if len(weapons) > 0 and weapons[0]:
             gun = weapons[0]
